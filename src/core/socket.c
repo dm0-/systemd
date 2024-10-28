@@ -1281,6 +1281,75 @@ static int mq_address_create(
         return TAKE_FD(fd);
 }
 
+static int mq_address_create_in_child_process(Socket *s, const char *path) {
+        _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
+        int qfd, r;
+
+        assert(path);
+
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, pair) < 0)
+                return log_unit_error_errno(UNIT(s), errno, "Failed to create communication channel: %m");
+
+        r = unit_fork_helper_process(UNIT(s), "(sd-mq_open)", /* into_cgroup= */ true, &pid);
+        if (r < 0)
+                return log_unit_error_errno(UNIT(s), r, "Failed to fork off queue creation process: %m");
+        if (r == 0) {
+                /* Child */
+
+                pair[0] = safe_close(pair[0]);
+
+#if HAVE_SELINUX
+                /* Linux labels message queues based on transitions as in the following SELinux policy CIL.
+                 *     (typetransition process_type_t tmpfs_t file message_queue_t)
+                 * So this creator process needs to change to process_type_t for the queue to be created with
+                 * the message_queue_t label as defined in the policy.  (The tmpfs_t is the /dev/mqueue type.)
+                 */
+                if (mac_selinux_use() && !isempty(s->exec_context.selinux_context)) {
+                        const char *context = s->exec_context.selinux_context;
+
+                        r = setcon(context);
+                        if (r < 0) {
+                                if (!s->exec_context.selinux_context_ignore) {
+                                        log_unit_error_errno(UNIT(s), r, "Failed to change SELinux context to %s: %m", context);
+                                        _exit(EXIT_SELINUX_CONTEXT);
+                                }
+                                log_unit_debug_errno(UNIT(s), r, "Failed to change SELinux context to %s, ignoring: %m", context);
+                        }
+                }
+#endif
+
+                qfd = mq_address_create(path, s->socket_mode, s->mq_maxmsg, s->mq_msgsize);
+                if (qfd < 0) {
+                        log_unit_error_errno(UNIT(s), qfd, "Failed to create message queue: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                r = send_one_fd(pair[1], qfd, 0);
+                if (r < 0) {
+                        log_unit_error_errno(UNIT(s), r, "Failed to send message queue to parent: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        pair[1] = safe_close(pair[1]);
+        qfd = receive_one_fd(pair[0], 0);
+
+        /* We synchronously wait for the helper, as it shouldn't be slow */
+        r = wait_for_terminate_and_check("(sd-mq_open)", pid.pid, WAIT_LOG_ABNORMAL);
+        if (r < 0) {
+                safe_close(qfd);
+                return r;
+        }
+
+        if (qfd < 0)
+                return log_unit_error_errno(UNIT(s), qfd, "Failed to receive message queue: %m");
+
+        return qfd;
+}
+
 static int socket_symlink(Socket *s) {
         const char *p;
         int r;
@@ -1703,11 +1772,15 @@ static int socket_open_fds(Socket *orig_s) {
 
                 case SOCKET_MQUEUE:
 
-                        p->fd = mq_address_create(
-                                        p->path,
-                                        s->socket_mode,
-                                        s->mq_maxmsg,
-                                        s->mq_msgsize);
+                        if (mac_selinux_use() && !isempty(s->exec_context.selinux_context))
+                                /* Linux labels message queues based on the creator process context. */
+                                p->fd = mq_address_create_in_child_process(s, p->path);
+                        else
+                                p->fd = mq_address_create(
+                                                p->path,
+                                                s->socket_mode,
+                                                s->mq_maxmsg,
+                                                s->mq_msgsize);
                         if (p->fd < 0)
                                 return log_unit_error_errno(UNIT(s), p->fd, "Failed to open message queue %s: %m", p->path);
                         break;
