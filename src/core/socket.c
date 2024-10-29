@@ -1274,8 +1274,8 @@ static int mq_address_create(
                 return -errno;
 
         if ((st.st_mode & 0777) != (mq_mode & ~old_mask) ||
-            st.st_uid != getuid() ||
-            st.st_gid != getgid())
+            st.st_uid != geteuid() ||
+            st.st_gid != getegid())
                 return -EEXIST;
 
         return TAKE_FD(fd);
@@ -1295,9 +1295,49 @@ static int mq_address_create_in_child_process(Socket *s, const char *path) {
         if (r < 0)
                 return log_unit_error_errno(UNIT(s), r, "Failed to fork off queue creation process: %m");
         if (r == 0) {
+                const char *user = s->user;
+                const char *group = s->group;
+                uid_t uid = UID_INVALID;
+                gid_t gid = GID_INVALID;
+
                 /* Child */
 
                 pair[0] = safe_close(pair[0]);
+
+                /* There is apparently a deadlock in NSS without this... */
+                setenv("SYSTEMD_BYPASS_USERDB", "io.systemd.DynamicUser", 1);
+
+                if (!isempty(user)) {
+                        r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                        if (r < 0) {
+                                log_unit_error_errno(UNIT(s), r, "Failed to resolve user %s: %m", user);
+                                _exit(EXIT_USER);
+                        }
+                }
+
+                if (!isempty(group)) {
+                        r = get_group_creds(&group, &gid, 0);
+                        if (r < 0) {
+                                log_unit_error_errno(UNIT(s), r, "Failed to resolve group %s: %m", group);
+                                _exit(EXIT_GROUP);
+                        }
+                }
+
+                if (gid_is_valid(gid)) {
+                        r = setegid(gid);
+                        if (r < 0) {
+                                log_unit_error_errno(UNIT(s), r, "Failed to set effective group %s (%u): %m", group, gid);
+                                _exit(EXIT_GROUP);
+                        }
+                }
+
+                if (uid_is_valid(uid)) {
+                        r = seteuid(uid);
+                        if (r < 0) {
+                                log_unit_error_errno(UNIT(s), r, "Failed to set effective user %s (%u): %m", user, uid);
+                                _exit(EXIT_USER);
+                        }
+                }
 
 #if HAVE_SELINUX
                 /* Linux labels message queues based on transitions as in the following SELinux policy CIL.
@@ -2097,14 +2137,6 @@ static int socket_chown(Socket *s, PidRef *ret_pid) {
                                 path = socket_address_get_path(&p->address);
                         else if (p->type == SOCKET_FIFO)
                                 path = p->path;
-                        else if (p->type == SOCKET_MQUEUE) {
-                                /* Use fchown on the fd since /dev/mqueue might not be mounted. */
-                                if (fchown(p->fd, uid, gid) < 0) {
-                                        log_unit_error_errno(UNIT(s), errno, "Failed to fchown(): %m");
-                                        _exit(EXIT_CHOWN);
-                                }
-                                continue;
-                        }
 
                         if (!path)
                                 continue;
